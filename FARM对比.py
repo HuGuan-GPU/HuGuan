@@ -1,380 +1,339 @@
-import os
-import glob
-import math
-import shutil
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 
+import argparse
+from pathlib import Path
+from typing import Dict, Any
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.fft
+from PIL import Image
+import matplotlib.pyplot as plt
 from torchvision import transforms
 
 
-
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
-
-
-
 class FARM(nn.Module):
-    def __init__(self, in_channels=3):
+    def __init__(self, in_channels: int = 3):
         super().__init__()
         self.freq_controller = nn.Sequential(
             nn.Conv2d(in_channels, in_channels * 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels * 2),
+            nn.GELU(),
+            nn.Conv2d(
+                in_channels * 2,
+                in_channels * 2,
+                kernel_size=3,
+                padding=1,
+                groups=in_channels * 2,
+                bias=False,
+            ),
             nn.GELU(),
             nn.Conv2d(in_channels * 2, in_channels, kernel_size=1, bias=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
+        self.alpha = nn.Parameter(torch.tensor([0.1], dtype=torch.float32))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, return_vis: bool = False):
+        # Same FFT normalization and log-amplitude formulation as GitHub FARM.py
         fft_x = torch.fft.fft2(x, norm="ortho")
-        fft_x_shifted = torch.fft.fftshift(fft_x)
+        fft_x_shifted = torch.fft.fftshift(fft_x, dim=(-2, -1))
 
-        amplitude = torch.abs(fft_x_shifted)
-        freq_mask = self.freq_controller(amplitude)
+        amplitude = torch.log1p(torch.abs(fft_x_shifted))
+        m_freq = self.freq_controller(amplitude)
 
-        fft_x_filtered = fft_x_shifted * freq_mask
-        fft_x_ishifted = torch.fft.ifftshift(fft_x_filtered)
+        fft_x_filtered = fft_x_shifted * m_freq
+        fft_x_ishifted = torch.fft.ifftshift(fft_x_filtered, dim=(-2, -1))
         x_restored = torch.fft.ifft2(fft_x_ishifted, norm="ortho").real
 
-        return x + x_restored
+        output = x + self.alpha * x_restored
+        output = torch.clamp(output, 0.0, 1.0)
+
+        if return_vis:
+            return output, amplitude, m_freq
+        return output
 
 
-
-CLASS_NAME_MAP = {
-    "喉癌": "laryngocarcinoma",
-    "声带白斑": "leukoplakia",
-    "声带沟": "sulcus vocalis",
-    "声带息肉": "polyp",
-    "声带炎": "chorditis vocalis",
-    "正常声带图片": "normal vocal fold",
-    "声带癌": "laryngocarcinoma",
-    "声带囊肿": "cyst",
-    "声带乳头状瘤": "papillary carcinoma",
-}
-
-
-
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
-
-
-def remove_hidden_dirs(root_dir):
-    if not os.path.isdir(root_dir):
-        return
-
-    for current_root, dirnames, _ in os.walk(root_dir):
-        for d in list(dirnames):
-            if d.startswith(".") or "ipynb_checkpoints" in d or "__pycache__" in d:
-                hidden_dir = os.path.join(current_root, d)
-                shutil.rmtree(hidden_dir, ignore_errors=True)
-                print(f"Removed hidden folder: {hidden_dir}")
-
-
-def load_image_paths(root_dir):
+def _unwrap_checkpoint(obj: Any) -> Dict[str, torch.Tensor]:
     """
-    支持：
-    1) root_dir/*.jpg
-    2) root_dir/类别/*.jpg
-    并跳过隐藏目录/文件
+    Supports common checkpoint formats:
+      - raw state_dict
+      - {"state_dict": ...}
+      - {"model_state_dict": ...}
+      - {"model": ...}
+      - {"net": ...}
     """
-    exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.webp"]
-    image_paths = []
+    if not isinstance(obj, dict):
+        raise TypeError("Checkpoint is not a dictionary/state_dict.")
 
-    if not os.path.isdir(root_dir):
-        return image_paths
+    for key in ("state_dict", "model_state_dict", "model", "net"):
+        if key in obj and isinstance(obj[key], dict):
+            return obj[key]
 
-    root_has_images = False
-    for ext in exts:
-        paths = glob.glob(os.path.join(root_dir, ext))
-        paths = [p for p in paths if "/." not in p.replace("\\", "/")]
-        if len(paths) > 0:
-            root_has_images = True
-            image_paths.extend(paths)
+    # raw state_dict
+    if all(isinstance(k, str) for k in obj.keys()):
+        return obj
 
-    if root_has_images:
-        return sorted(image_paths)
-
-    subdirs = [os.path.join(root_dir, d) for d in os.listdir(root_dir)]
-    subdirs = [
-        d for d in subdirs
-        if os.path.isdir(d)
-        and not os.path.basename(d).startswith(".")
-        and "__pycache__" not in os.path.basename(d)
-        and "ipynb_checkpoints" not in os.path.basename(d)
-    ]
-
-    for sub in subdirs:
-        for ext in exts:
-            paths = glob.glob(os.path.join(sub, ext))
-            paths = [p for p in paths if "/." not in p.replace("\\", "/")]
-            image_paths.extend(paths)
-
-    return sorted(image_paths)
+    raise RuntimeError("Unsupported checkpoint structure.")
 
 
-def get_class_name_from_path(path, root_dir=None):
-    """
-    如果图片直接在 root_dir 下：
-        用文件名（去后缀）作为类别名
-    如果图片在子文件夹下：
-        用父文件夹名作为类别名
-    """
-    filename = os.path.splitext(os.path.basename(path))[0]
-    parent = os.path.basename(os.path.dirname(path))
-
-    if root_dir is not None:
-        root_dir = os.path.abspath(root_dir)
-        parent_dir = os.path.abspath(os.path.dirname(path))
-        if parent_dir == root_dir:
-            return filename
-
-    if parent.startswith(".") or "ipynb_checkpoints" in parent:
-        return filename
-
-    return parent
-
-
-def map_to_english_class_name(chinese_name):
-    return CLASS_NAME_MAP.get(chinese_name, chinese_name)
-
-
-def tensor_to_rgb_image(tensor, mean, std):
-    if tensor.dim() == 4:
-        tensor = tensor[0]
-    img = tensor.detach().cpu().permute(1, 2, 0).numpy()
-    img = img * std + mean
-    img = np.clip(img, 0.0, 1.0)
-    img = (img * 255.0).astype(np.uint8)
-    return img
-
-
-def diff_heatmap(img_before, img_after):
-    diff = np.abs(img_after.astype(np.float32) - img_before.astype(np.float32)).mean(axis=2)
-    diff = diff / (diff.max() + 1e-8)
-    return diff
-
-
-def metric_saturation_ratio(gray):
-    return float(np.mean(gray >= 245))
-
-
-def metric_tenengrad(gray):
-    gray_f = gray.astype(np.float32)
-    gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
-    fm = gx * gx + gy * gy
-    return float(np.mean(fm))
-
-
-def evaluate_simple_metrics(img_rgb):
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    return {
-        "saturation_ratio": metric_saturation_ratio(gray),
-        "tenengrad": metric_tenengrad(gray),
-    }
-
-
-def load_farm_weights_from_checkpoint(farm_model, checkpoint_path, device):
-    ckpt = torch.load(checkpoint_path, map_location=device)
-
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-    elif isinstance(ckpt, dict):
-        state_dict = ckpt
-    else:
-        raise ValueError("Unsupported checkpoint format.")
-
-    farm_state = {}
-    for k, v in state_dict.items():
-        if k.startswith("farm."):
-            farm_state[k[len("farm."):]] = v
-
-    if len(farm_state) == 0:
-        raise ValueError("No FARM weights found in checkpoint.")
-
-    missing, unexpected = farm_model.load_state_dict(farm_state, strict=False)
-    print("FARM weights loaded successfully.")
-    print("Missing keys:", missing)
-    print("Unexpected keys:", unexpected)
-
-
-def save_before_after_figure(
-    save_path,
-    display_name,
-    before_rgb,
-    after_rgb,
-    diff_map,
-    metrics_before,
-    metrics_after
-):
-    fig = plt.figure(figsize=(15, 5))
-
-    ax1 = fig.add_subplot(1, 3, 1)
-    ax1.imshow(before_rgb)
-    ax1.set_title(display_name, fontsize=12)
-    ax1.axis("off")
-
-    ax2 = fig.add_subplot(1, 3, 2)
-    ax2.imshow(after_rgb)
-    ax2.set_title(f"{display_name} After FARM", fontsize=12)
-    ax2.axis("off")
-
-    ax3 = fig.add_subplot(1, 3, 3)
-    ax3.imshow(diff_map, cmap="hot")
-    ax3.set_title("Difference Heatmap", fontsize=12)
-    ax3.axis("off")
-
-    text = (
-        f"Saturation Ratio (↓): {metrics_before['saturation_ratio']:.4f} -> {metrics_after['saturation_ratio']:.4f}\n"
-        f"Tenengrad (↑): {metrics_before['tenengrad']:.2f} -> {metrics_after['tenengrad']:.2f}"
+def extract_farm_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    prefixes = (
+        "farm.",
+        "module.farm.",
+        "model.farm.",
+        "module.model.farm.",
+        "network.farm.",
     )
-    plt.figtext(0.5, 0.02, text, ha="center", fontsize=11)
-    plt.tight_layout(rect=[0, 0.08, 1, 1])
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    for prefix in prefixes:
+        subset = {
+            k[len(prefix):]: v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
+        if subset:
+            return subset
+
+    if (
+        "alpha" in state_dict
+        or any(k.startswith("freq_controller.") for k in state_dict)
+    ):
+        return state_dict
+
+    sample_keys = list(state_dict.keys())[:30]
+    raise RuntimeError(
+        "No FARM parameters were found in the checkpoint.\n"
+        "The first checkpoint keys are:\n  "
+        + "\n  ".join(sample_keys)
+    )
+
+
+def load_trained_farm(weight_path: Path, device: torch.device) -> FARM:
+    if not weight_path.is_file():
+        raise FileNotFoundError(
+            f"Cannot find checkpoint:\n{weight_path}\n\n"
+            "Put best_vmamba_laryngeal.pth in the same folder as this script."
+        )
+
+    print(f"[INFO] Loading checkpoint: {weight_path}")
+    raw = torch.load(str(weight_path), map_location=device)
+    state_dict = _unwrap_checkpoint(raw)
+    farm_state = extract_farm_state_dict(state_dict)
+
+    model = FARM(in_channels=3).to(device)
+
+    try:
+        model.load_state_dict(farm_state, strict=True)
+    except RuntimeError as e:
+        print("\n[ERROR] FARM weights do not exactly match this FARM structure.")
+        print("[INFO] Extracted FARM keys:")
+        for k in farm_state.keys():
+            print("   ", k)
+        raise e
+
+    model.eval()
+    print("[INFO] FARM weights loaded successfully.")
+    print(f"[INFO] Learned alpha = {model.alpha.item():.6f}")
+    return model
+
+
+CLASS_ORDER = [
+    ("Laryngeal_carcinoma.jpg", "Laryngeal carcinoma"),
+    ("Vocal_fold_polyp.jpg", "Vocal fold polyp"),
+    ("Vocal_fold_leukoplakia.jpg", "Vocal fold leukoplakia"),
+    ("Chorditis_vocalis.jpg", "Chorditis vocalis"),
+    ("Normal_vocal_folds.jpg", "Normal vocal folds"),
+    ("Sulcus_vocalis.jpg", "Sulcus vocalis"),
+]
+
+
+def find_image(input_dir: Path, preferred_filename: str) -> Path:
+    stem = Path(preferred_filename).stem.lower()
+
+    candidates = []
+    for p in input_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
+            continue
+        if p.stem.lower() == stem:
+            return p
+        candidates.append(p)
+
+    raise FileNotFoundError(
+        f"Cannot find image for '{preferred_filename}' in:\n{input_dir}\n"
+        f"Available image files: {[p.name for p in candidates]}"
+    )
+
+
+def load_image(image_path: Path, image_size: int = 256) -> torch.Tensor:
+    image = Image.open(image_path).convert("RGB")
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+    ])
+    return transform(image)
+
+
+def tensor_to_rgb(x: torch.Tensor) -> np.ndarray:
+    return (
+        x.detach()
+         .squeeze(0)
+         .permute(1, 2, 0)
+         .cpu()
+         .numpy()
+    )
+
+
+def create_before_after_figure(
+    input_dir: Path,
+    model: FARM,
+    device: torch.device,
+    output_dir: Path,
+    image_size: int = 256,
+    dpi: int = 400,
+):
+    originals = []
+    processed = []
+    labels = []
+
+    with torch.no_grad():
+        for filename, label in CLASS_ORDER:
+            image_path = find_image(input_dir, filename)
+            x = load_image(image_path, image_size=image_size).unsqueeze(0).to(device)
+
+            y, amplitude, freq_mask = model(x, return_vis=True)
+
+            ori_np = np.clip(tensor_to_rgb(x), 0.0, 1.0)
+            out_np = np.clip(tensor_to_rgb(y), 0.0, 1.0)
+
+            originals.append(ori_np)
+            processed.append(out_np)
+            labels.append(label)
+
+            print(
+                f"[INFO] {filename:<30} "
+                f"mask mean={freq_mask.mean().item():.4f}, "
+                f"min={freq_mask.min().item():.4f}, "
+                f"max={freq_mask.max().item():.4f}"
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(
+        2, 6,
+        figsize=(15.8, 5.25),
+        dpi=dpi,
+        gridspec_kw={"wspace": 0.035, "hspace": 0.10},
+    )
+
+    for col, label in enumerate(labels):
+        axes[0, col].imshow(originals[col])
+        axes[0, col].set_title(label, fontsize=10, pad=5)
+        axes[0, col].axis("off")
+
+        axes[1, col].imshow(processed[col])
+        axes[1, col].axis("off")
+
+    axes[0, 0].text(
+        -0.11, 0.5, "Before FARM",
+        transform=axes[0, 0].transAxes,
+        rotation=90, va="center", ha="center",
+        fontsize=11, fontweight="bold",
+    )
+    axes[1, 0].text(
+        -0.11, 0.5, "After FARM",
+        transform=axes[1, 0].transAxes,
+        rotation=90, va="center", ha="center",
+        fontsize=11, fontweight="bold",
+    )
+
+    plt.subplots_adjust(left=0.055, right=0.995, top=0.94, bottom=0.02)
+
+    png_path = output_dir / "farm_before_after_2x6.png"
+    svg_path = output_dir / "farm_before_after_2x6.svg"
+    pdf_path = output_dir / "farm_before_after_2x6.pdf"
+
+    fig.savefig(png_path, dpi=dpi, bbox_inches="tight", pad_inches=0.03)
+    fig.savefig(svg_path, bbox_inches="tight", pad_inches=0.03)
+    fig.savefig(pdf_path, bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
 
-
-
-def save_summary_grid(save_path, results):
-    """
-    两行排列
-    每个类别占两列：
-    左：英文类别名
-    右：英文类别名 + After FARM
-    """
-    n = len(results)
-    if n == 0:
-        return
-
-    num_rows = 2
-    num_per_row = math.ceil(n / 2)
-    num_cols = num_per_row * 2
-
-    fig = plt.figure(figsize=(4 * num_cols, 4 * num_rows))
-
-    for idx, item in enumerate(results):
-        row = idx // num_per_row
-        col_group = idx % num_per_row
-
-        ax_before = fig.add_subplot(num_rows, num_cols, row * num_cols + col_group * 2 + 1)
-        ax_before.imshow(item["before_rgb"])
-        ax_before.set_title(item["display_name"], fontsize=12)
-        ax_before.axis("off")
-
-        ax_after = fig.add_subplot(num_rows, num_cols, row * num_cols + col_group * 2 + 2)
-        ax_after.imshow(item["after_rgb"])
-        ax_after.set_title(f"{item['display_name']} After FARM", fontsize=12)
-        ax_after.axis("off")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    print("\n[OK] Figure generation completed.")
+    print(f"[OK] PNG: {png_path}")
+    print(f"[OK] SVG: {svg_path}")
+    print(f"[OK] PDF: {pdf_path}")
 
 
 def main():
-    test_dir = "/FM-Vmamba/Vmamba/VMamba-main/test_image_256"
-    checkpoint_path = "/FM-Vmamba/Vmamba/VMamba-main/best_vmamba_laryngeal.pth"
-    output_dir = "./farm_before_after_results"
-    input_size = 224
+    script_dir = Path(__file__).resolve().parent
 
-    desired_order = [
-        "喉癌",
-        "声带息肉",
-        "声带白斑",
-        "声带炎",
-        "正常声带图片",
-        "声带沟"
-    ]
+    parser = argparse.ArgumentParser(
+        description="Generate a 2x6 before/after FARM figure using trained FARM weights."
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=str(script_dir / "best_vmamba_laryngeal.pth"),
+        help="Full FM-VMamba checkpoint. Default: best_vmamba_laryngeal.pth beside the script.",
+    )
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        default=str(script_dir / "test_image"),
+        help="Folder containing the six test images. Default: ./test_image",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=str(script_dir / "farm_vis_output"),
+        help="Output folder. Default: ./farm_vis_output",
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=256,
+        help="Image resize used by the GitHub visualization code. Default: 256.",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=400,
+        help="PNG resolution. Default: 400 dpi.",
+    )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU even if CUDA is available.",
+    )
+    args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ensure_dir(output_dir)
-    ensure_dir(os.path.join(output_dir, "single"))
+    device = torch.device(
+        "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"[INFO] Device: {device}")
 
-    remove_hidden_dirs(test_dir)
+    checkpoint = Path(args.checkpoint)
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
 
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-    transform = transforms.Compose([
-        transforms.Resize((input_size, input_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean.tolist(), std=std.tolist())
-    ])
-
-    farm = FARM(in_channels=3).to(device)
-    farm.eval()
-
-    if not os.path.isfile(checkpoint_path):
+    if not input_dir.is_dir():
         raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}\n"
-            "Please provide the trained checkpoint first."
+            f"Cannot find test-image folder:\n{input_dir}\n\n"
+            "Create a 'test_image' folder beside the script and put the six images inside."
         )
 
-    load_farm_weights_from_checkpoint(farm, checkpoint_path, device)
+    model = load_trained_farm(checkpoint, device)
 
-    image_paths = load_image_paths(test_dir)
-    if len(image_paths) == 0:
-        raise FileNotFoundError(f"No images found in {test_dir}")
-
-    summary_results = []
-
-    with torch.no_grad():
-        for img_path in image_paths:
-            class_name_cn = get_class_name_from_path(img_path, test_dir)
-            display_name = map_to_english_class_name(class_name_cn)
-            img_name = os.path.splitext(os.path.basename(img_path))[0]
-
-            img_pil = Image.open(img_path).convert("RGB")
-            x = transform(img_pil).unsqueeze(0).to(device)
-            y = farm(x)
-
-            before_rgb = tensor_to_rgb_image(x, mean, std)
-            after_rgb = tensor_to_rgb_image(y, mean, std)
-            diff_map = diff_heatmap(before_rgb, after_rgb)
-
-            metrics_before = evaluate_simple_metrics(before_rgb)
-            metrics_after = evaluate_simple_metrics(after_rgb)
-
-            save_path = os.path.join(
-                output_dir,
-                "single",
-                f"{display_name}_{img_name}_before_after.png"
-            )
-            save_before_after_figure(
-                save_path=save_path,
-                display_name=display_name,
-                before_rgb=before_rgb,
-                after_rgb=after_rgb,
-                diff_map=diff_map,
-                metrics_before=metrics_before,
-                metrics_after=metrics_after
-            )
-
-            summary_results.append({
-                "class_name_cn": class_name_cn,
-                "display_name": display_name,
-                "before_rgb": before_rgb,
-                "after_rgb": after_rgb
-            })
-
-            print(f"Saved: {save_path}")
-
-    def sort_key(item):
-        if item["class_name_cn"] in desired_order:
-            return desired_order.index(item["class_name_cn"])
-        return len(desired_order)
-
-    summary_results = sorted(summary_results, key=sort_key)
-
-    grid_path = os.path.join(output_dir, "farm_before_after_summary.png")
-    save_summary_grid(grid_path, summary_results)
-    print(f"Saved: {grid_path}")
+    create_before_after_figure(
+        input_dir=input_dir,
+        model=model,
+        device=device,
+        output_dir=output_dir,
+        image_size=args.image_size,
+        dpi=args.dpi,
+    )
 
 
 if __name__ == "__main__":
