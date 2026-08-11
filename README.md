@@ -64,7 +64,6 @@ FM-VMamba-main/
 ├── train.py                         # FM-VMamba 五折训练与评估主脚本
 ├── train_laryngeal.py               # 基础 VMamba 训练脚本
 ├── Train_FARM_Mona.py               # FARM + Mona 组合实验脚本
-├── FARM.py                           # FARM 模块及可视化代码
 ├── offline_augment.py                # 独立离线增广/固定划分辅助脚本
 ├── check_duplicate_images.py         # 重复与近重复图像质量控制
 ├── prepare_grouped_dataset.py        # 数据整理辅助脚本
